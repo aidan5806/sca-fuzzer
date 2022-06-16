@@ -6,6 +6,7 @@ SPDX-License-Identifier: MIT
 """
 from __future__ import annotations
 
+import sys
 import random
 import abc
 import re
@@ -132,7 +133,11 @@ class ConfigurableGenerator(Generator, abc.ABC):
                 lines = f.read().split("\n")
 
             for msg in error_msg.split("\n"):
-                msg = msg.removeprefix(asm_file + ":")
+                if (sys.version_info >= (3, 9)):
+                    msg = msg.removeprefix(asm_file + ":")
+                else:
+                    if msg.startswith(asm_file + ":"):
+                        msg = msg[len(asm_file + ":"):]
                 line_num_str = re.search(r"(\d+):", msg)
                 if not line_num_str:
                     print(msg)
@@ -220,7 +225,13 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
 
         # Create basic blocks
         node_count = random.randint(CONF.min_bb_per_function, CONF.max_bb_per_function)
-        func_name = label.removeprefix(".function_")
+        if (sys.version_info >= (3, 9)):
+            func_name = label.removeprefix(".function_")
+        else:
+            if label.startswith(".function_"):
+                func_name = label[len(".function_"):]
+            else:
+                func_name = label
         nodes = [BasicBlock(f".bb_{func_name}.{i}") for i in range(node_count)]
 
         # Connect BBs into a graph
@@ -676,7 +687,13 @@ class X86Generator(ConfigurableGenerator, abc.ABC):
             line = re.search(r"(.*)#.*", line).group(1).strip()  # type: ignore
 
         # extract operands
-        operands_raw = line.removeprefix(name).split(",")
+        if (sys.version_info >= (3, 9)):
+            operands_raw = line.removeprefix(name).split(",")
+        else:
+            if line.startswith(name):
+                operands_raw = line[len(name):].split(",")
+            else:
+                operands_raw = line.split(",")
         if operands_raw == [""]:  # no operands
             operands_raw = []
         else:  # clean the operands

@@ -4,6 +4,7 @@ Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
 """
 
+import sys
 import json
 import subprocess
 from argparse import ArgumentParser
@@ -114,9 +115,18 @@ class X86Transformer:
 
             # clean up the name
             name = instruction_node.attrib['asm']
-            name = name.removeprefix("{load} ")
-            name = name.removeprefix("{store} ")
-            name = name.removeprefix("{disp32} ")
+
+            if (sys.version_info >= (3, 9)):
+                name = name.removeprefix("{load} ")
+                name = name.removeprefix("{store} ")
+                name = name.removeprefix("{disp32} ")
+            else:
+                if name.startswith("{load} "):
+                    name = name[len("{load} "):]
+                if name.startswith("{store} "):
+                    name = name[len("{store} "):]
+                if name.startswith("{disp32} "):
+                    name = name[len("{disp32} "):]
             self.instruction.name = name
 
             try:
@@ -291,7 +301,7 @@ def main():
     args = parser.parse_args()
 
     subprocess.run("wget "
-                   "https://uops.info/instructions_Jan2022.xml", shell=True, check=True)
+                   "https://uops.info/instructions_Jan2022.xml --no-check-certificate", shell=True, check=True)
 
     try:
         transformer = X86Transformer()
