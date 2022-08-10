@@ -155,6 +155,12 @@ class FlagsOperand(Operand):
         return False
 
 
+class CondOperand(Operand):
+
+    def __init__(self, value):
+        super().__init__(value, OT.COND, True, False)
+
+
 class InstructionSpec:
     name: str
     operands: List[OperandSpec]
@@ -309,6 +315,22 @@ class Instruction:
 
         return res
 
+    def get_cond_operand(self) -> Optional[CondOperand]:
+        for o in self.operands:
+            if isinstance(o, CondOperand):
+                return o
+
+        # not checking implicit operands -> conditions must be explicit
+        return None
+
+    def get_label_operand(self) -> Optional[LabelOperand]:
+        for o in self.operands:
+            if isinstance(o, LabelOperand):
+                return o
+
+        # not checking implicit operands -> labels must be explicit
+        return None
+
 
 class BasicBlock:
     name: str
@@ -454,6 +476,7 @@ class TestCase:
 
     def __init__(self):
         self.functions = []
+        self.address_map = {}
 
     def __iter__(self):
         for func in self.functions:
@@ -481,7 +504,7 @@ class Input(np.ndarray):
     |   Register Values    | Conf.input_register_region_size
     +----------------------+
     |                      |
-    |                      | Conf.input_assist_region_size
+    |                      | Conf.input_faulty_region_size
     | Assist Region Values |
     +----------------------+
     |                      |
@@ -499,7 +522,7 @@ class Input(np.ndarray):
         pass  # unreachable; defined only for type checking
 
     def __new__(cls):
-        data_size = (CONF.input_main_region_size + CONF.input_assist_region_size +
+        data_size = (CONF.input_main_region_size + CONF.input_faulty_region_size +
                      CONF.input_register_region_size) // 8
         aligned_size = data_size + (4096 - CONF.input_register_region_size) // 8
         obj = super().__new__(cls, (aligned_size,), np.uint64, None, 0, None, None)  # type: ignore
@@ -513,6 +536,9 @@ class Input(np.ndarray):
 
     def get_registers(self):
         return list(self[self.register_start:self.data_size - 1])
+
+    def get_memory(self):
+        return self[0:self.register_start]
 
     def __str__(self):
         return str(self.seed)
@@ -534,10 +560,10 @@ class InputTaint(np.ndarray):
         pass  # unreachable; defined only for type checking
 
     def __new__(cls):
-        size = (CONF.input_main_region_size + CONF.input_assist_region_size +
+        size = (CONF.input_main_region_size + CONF.input_faulty_region_size +
                 CONF.input_register_region_size) // 8
         obj = super().__new__(cls, (size,), bool, None, 0, None, None)  # type: ignore
-        obj.register_start = (CONF.input_main_region_size + CONF.input_assist_region_size) // 8
+        obj.register_start = (CONF.input_main_region_size + CONF.input_faulty_region_size) // 8
         return obj
 
 
@@ -556,7 +582,6 @@ class EquivalenceClass:
     ctrace: CTrace
     measurements: List[Measurement]
     htrace_map: HTraceMap
-    primed_positions: Dict[int, List[int]]
     MOD2P64 = pow(2, 64)
 
     def __init__(self) -> None:
@@ -687,7 +712,7 @@ class Coverage(ABC):
 
 
 class Model(ABC):
-    coverage: Coverage
+    coverage: Optional[Coverage] = None
 
     @abstractmethod
     def __init__(self, sandbox_base: int, code_base: int):
@@ -730,7 +755,7 @@ class Executor(ABC):
 
 
 class Analyser(ABC):
-    coverage: Coverage
+    coverage: Optional[Coverage] = None
 
     @abstractmethod
     def filter_violations(self,
@@ -742,3 +767,13 @@ class Analyser(ABC):
 
     def set_coverage(self, coverage: Coverage):
         self.coverage = coverage
+
+
+class Minimizer(ABC):
+
+    def __init__(self, instruction_set_spec: InstructionSetAbstract):
+        pass
+
+    @abstractmethod
+    def minimize(self, test_case_asm: str, outfile: str, num_inputs: int, add_fences: bool):
+        pass

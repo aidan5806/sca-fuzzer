@@ -10,9 +10,8 @@ from typing import Dict, Set, List, Optional
 from isa_loader import InstructionSet
 from interfaces import Coverage, EquivalenceClass, TestCase, Executor, Model, Analyser, \
      ExecutionTrace, TracedInstruction, Instruction, RegisterOperand, OT
-from generator import X86Registers
+from x86.x86_generator import X86TargetDesc
 
-from config import CONF, ConfigException
 from service import STAT
 
 
@@ -118,7 +117,7 @@ class DependentPairCoverage(Coverage):
                     self.coverage[DT.REG_FLAGS].add(key)
 
     def _calculate_max_coverage(self):
-        all_, reg_src, reg_dest, flags_src, flags_dest, mem_src, mem_dest, control_cond = (0, ) * 8
+        all_, reg_src, reg_dest, flags_src, flags_dest, mem_src, mem_dest, control_cond = (0,) * 8
         control_direct = 1
 
         for inst in self.instruction_set.instructions:
@@ -247,8 +246,8 @@ class DependentPairCoverage(Coverage):
             r.value for r in inst1.get_dest_operands(True) if isinstance(r, RegisterOperand)
         ]
         src_regs = [r.value for r in inst2.get_src_operands(True) if isinstance(r, RegisterOperand)]
-        dest_regs = [X86Registers.gpr_normalized[r] for r in dest_regs]
-        src_regs = [X86Registers.gpr_normalized[r] for r in src_regs]
+        dest_regs = [X86TargetDesc.gpr_normalized[r] for r in dest_regs]
+        src_regs = [X86TargetDesc.gpr_normalized[r] for r in src_regs]
         for r in dest_regs:
             if r in src_regs:
                 return DT.REG_GPR
@@ -276,14 +275,3 @@ class DependentPairCoverage(Coverage):
             size = len(self.coverage[k])
             ratio = (size / self.max_coverage[k]) * 100
             print(f"- {str(k)}: {size} [{ratio:.3}%]")
-
-
-def get_coverage(instruction_set: InstructionSet, executor: Executor, model: Model,
-                 analyser: Analyser) -> Coverage:
-    if CONF.coverage_type == 'dependent-pairs':
-        return DependentPairCoverage(instruction_set, executor, model, analyser)
-    elif CONF.coverage_type == 'none':
-        return NoCoverage(instruction_set, executor, model, analyser)
-    else:
-        ConfigException("unknown value of `coverage_type` configuration option")
-        exit(1)

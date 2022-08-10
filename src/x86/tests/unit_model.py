@@ -4,17 +4,63 @@ SPDX-License-Identifier: MIT
 """
 import unittest
 import sys
+import tempfile
+import os
+from typing import List
+from pathlib import Path
 
 sys.path.insert(0, '..')
-from model import TaintTracker
+
+import x86.x86_model as x86_model
+import factory
 from interfaces import Instruction, RegisterOperand, MemoryOperand, InputTaint, LabelOperand, \
-    FlagsOperand
+    FlagsOperand, TestCase, InputGenerator, Input, CTrace
+from isa_loader import InstructionSet
+from x86.x86_generator import X86RandomGenerator
+from model import CTRTracer
+from copy import deepcopy
+
+from config import CONF
+
+test_path = Path(__file__).resolve()
+test_dir = test_path.parent
 
 
-class X86UnicornModelTest(unittest.TestCase):
+class X86ModelTest(unittest.TestCase):
+
+    def test_x86_model_random(self):
+        global CONF
+        prev_conf = deepcopy(CONF)
+        CONF.instruction_set = "x86-64"
+        CONF.model = 'x86-unicorn'
+
+        asm_file = tempfile.NamedTemporaryFile(delete=False)
+        min_x86_path = test_dir / "min_x86.json"
+
+        instruction_set = InstructionSet(min_x86_path.absolute().as_posix(),
+                                         CONF.supported_categories)
+        random_generator = X86RandomGenerator(instruction_set)
+        tc: TestCase = random_generator.create_test_case(asm_file.name)
+
+        model = x86_model.X86UnicornCond(0x1000000, 0x8000)
+        model.tracer = CTRTracer()
+        model.load_test_case(tc)
+
+        input_generator: InputGenerator = factory.get_input_generator()
+        inputs: List[Input] = input_generator.generate(CONF.input_gen_seed, 1)
+        ctraces: List[CTrace] = model.trace_test_case(inputs, 1)
+        self.assertTrue(len(ctraces) != 0)
+
+        asm_file.close()
+        os.unlink(asm_file.name)
+
+        CONF = prev_conf
+
+
+class X86TaintTrackerTest(unittest.TestCase):
 
     def test_dependency_tracking(self):
-        tracker = TaintTracker([])
+        tracker = x86_model.X86TaintTracker([])
 
         # reg -> reg
         tracker.start_instruction(Instruction("ADD")
@@ -58,7 +104,7 @@ class X86UnicornModelTest(unittest.TestCase):
         self.assertCountEqual(tracker.reg_dependencies['DI'], ['SI', 'DI', '0x80'])
 
     def test_tainting(self):
-        tracker = TaintTracker([])
+        tracker = x86_model.X86TaintTracker([])
 
         # Initial dependency
         tracker.start_instruction(Instruction("ADD")
@@ -93,9 +139,10 @@ class X86UnicornModelTest(unittest.TestCase):
                                   .add_op(FlagsOperand(["w", "", "", "", "", "", "", "", ""]), True)
                                   )  # yapf: disable
         tracker._finalize_instruction()
-        jmp_instruction = Instruction("JC").add_op(LabelOperand(".bb0"))\
-                          .add_op(FlagsOperand(["r", "", "", "", "", "", "", "", ""]), True)\
-                          .add_op(RegisterOperand("RIP", 64, True, True), True)
+        jmp_instruction = Instruction("JC")\
+            .add_op(LabelOperand(".bb0"))\
+            .add_op(FlagsOperand(["r", "", "", "", "", "", "", "", ""]), True)\
+            .add_op(RegisterOperand("RIP", 64, True, True), True)
         jmp_instruction.control_flow = True
         tracker.start_instruction(jmp_instruction)
         tracker.taint_pc()
@@ -118,7 +165,7 @@ class X86UnicornModelTest(unittest.TestCase):
         self.assertEqual(taint[reg_offset + 1], True)
 
     def test_label_to_taint(self):
-        tracker = TaintTracker([])
+        tracker = x86_model.X86TaintTracker([])
         tracker.tainted_labels = {'0x0', '0x40', '0x640', 'D', 'SI', '8', '14', 'DF', 'RIP'}
         taint: InputTaint = tracker.get_taint()
         register_start = taint.register_start
@@ -134,7 +181,6 @@ class X86UnicornModelTest(unittest.TestCase):
         # 8, 14, RIP - not a part of the input
 
         self.assertListEqual(list(taint), expected)
-
 
 
 if __name__ == '__main__':

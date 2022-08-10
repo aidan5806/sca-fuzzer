@@ -9,7 +9,7 @@ from typing import List, Dict
 
 from interfaces import HTrace, CTrace, Input, EquivalenceClass, Analyser, Measurement
 from config import CONF
-from service import STAT, LOGGER, TWOS_COMPLEMENT_MASK_64, bit_count
+from service import STAT, TWOS_COMPLEMENT_MASK_64, bit_count
 
 
 class EquivalenceAnalyser(Analyser):
@@ -41,7 +41,9 @@ class EquivalenceAnalyser(Analyser):
 
         equivalence_classes: List[EquivalenceClass] = self._build_equivalence_classes(
             inputs, ctraces, htraces, stats)
-        self.coverage.analyser_hook(equivalence_classes)
+
+        if self.coverage:
+            self.coverage.analyser_hook(equivalence_classes)
 
         violations: List[EquivalenceClass] = []
         for eq_cls in equivalence_classes:
@@ -103,13 +105,3 @@ class EquivalenceAnalyser(Analyser):
             eq_cls.build_htrace_map()
 
         return effective_classes
-
-
-def get_analyser() -> Analyser:
-    options = {
-        'equivalence-classes': EquivalenceAnalyser,
-    }
-    if CONF.analyser not in options:
-        LOGGER.error("unknown analyser in the config file")
-        exit(1)
-    return options[CONF.analyser]()

@@ -10,17 +10,16 @@ import sys
 import random
 import abc
 import re
-import math
-import iced_x86
-from typing import List, Dict, Set, Optional
+from typing import List, Dict
 from subprocess import CalledProcessError, run
+from collections import OrderedDict
 
 from isa_loader import InstructionSet
 from interfaces import Generator, TestCase, Operand, RegisterOperand, FlagsOperand, MemoryOperand, \
     ImmediateOperand, AgenOperand, LabelOperand, OT, Instruction, BasicBlock, Function, \
-    OperandSpec, InstructionSpec
+    OperandSpec, InstructionSpec, CondOperand
 from service import NotSupportedException
-from config import CONF, ConfigException
+from config import CONF
 
 
 # Helpers
@@ -59,10 +58,21 @@ class Printer(abc.ABC):
         pass
 
 
-class RegisterSet(abc.ABC):
+class TargetDesc(abc.ABC):
     register_sizes: Dict[str, int]
     registers: Dict[int, List[str]]
     simd_registers: Dict[int, List[str]]
+    branch_conditions: Dict[str, List[str]]
+
+    @staticmethod
+    @abc.abstractmethod
+    def is_unconditional_branch(inst: Instruction) -> bool:
+        pass
+
+    @staticmethod
+    @abc.abstractmethod
+    def is_call(inst: Instruction) -> bool:
+        pass
 
 
 class ConfigurableGenerator(Generator, abc.ABC):
@@ -73,7 +83,7 @@ class ConfigurableGenerator(Generator, abc.ABC):
     test_case: TestCase
     passes: List[Pass]  # set by subclasses
     printer: Printer  # set by subclasses
-    register_set: RegisterSet  # set by subclasses
+    target_desc: TargetDesc  # set by subclasses
 
     def __init__(self, instruction_set: InstructionSet):
         super().__init__(instruction_set)
@@ -81,15 +91,26 @@ class ConfigurableGenerator(Generator, abc.ABC):
             [i for i in self.instruction_set.instructions if i.control_flow]
         self.non_control_flow_instructions = \
             [i for i in self.instruction_set.instructions if not i.control_flow]
+        assert self.non_control_flow_instructions, \
+            "The instruction set is insufficient to generate a test case"
+        if CONF.max_bb_per_function > 1:
+            assert self.control_flow_instructions, \
+                "The instruction set is insufficient to generate a test case"
+
+        self.non_memory_access_instructions = \
+            [i for i in self.non_control_flow_instructions if not i.has_mem_operand]
+        if CONF.avg_mem_accesses != 0:
+            memory_access_instructions = \
+                [i for i in self.non_control_flow_instructions if i.has_mem_operand]
+            self.load_instruction = [i for i in memory_access_instructions if not i.has_write]
+            self.store_instructions = [i for i in memory_access_instructions if i.has_write]
+            assert self.load_instruction and self.store_instructions, \
+                "The instruction set does not have memory accesses while `avg_mem_accesses > 0`"
 
         if CONF.test_case_generator_seed:
             random.seed(CONF.test_case_generator_seed)
 
-    def reset_generator(self):
-        pass
-
     def create_test_case(self, asm_file: str) -> TestCase:
-        self.reset_generator()
         self.test_case = TestCase()
 
         # create the main function
@@ -149,6 +170,141 @@ class ConfigurableGenerator(Generator, abc.ABC):
         run(f"strip --remove-section=.note.gnu.property {bin_file}", shell=True, check=True)
         run(f"objcopy {bin_file} -O binary {bin_file}", shell=True, check=True)
 
+    def parse_existing_test_case(self, asm_file: str) -> TestCase:
+        test_case = TestCase()
+        test_case.asm_path = asm_file
+
+        # prepare regexes
+        re_redundant_spaces = re.compile(r"(?<![a-zA-Z0-9]) +")
+
+        # prepare a map of all instruction specs
+        instruction_map: Dict[str, List[InstructionSpec]] = {}
+        for spec in self.instruction_set.instructions:
+            if spec.name in instruction_map:
+                instruction_map[spec.name].append(spec)
+            else:
+                instruction_map[spec.name] = [spec]
+
+        # load the text and clean it up
+        lines = []
+        started = False
+        with open(asm_file, "r") as f:
+            for line in f:
+                # remove extra spaces
+                line = line.strip()
+                line = re_redundant_spaces.sub("", line)
+
+                # skip comments and empty lines
+                if not line or line[0] in ["", "#", "/"]:
+                    continue
+
+                # skip footer and header
+                if not started:
+                    started = (line == ".test_case_enter:")
+                    if line[0] != ".":
+                        test_case.num_prologue_instructions += 1
+                    continue
+                if line == ".test_case_exit:":
+                    break
+
+                lines.append(line)
+
+        # set defaults in case the main function is implicit
+        if not lines[0].startswith(".function_main:"):
+            lines = [".function_main:"] + lines
+
+        # map lines to functions and basic blocks
+        current_function = ""
+        current_bb = ".bb_main.entry"
+        test_case_map: Dict[str, Dict[str, List[str]]] = OrderedDict()
+        for line in lines:
+            # instruction
+            if not line.startswith("."):
+                test_case_map[current_function][current_bb].append(line)
+                continue
+
+            # function
+            if line.startswith(".function_"):
+                current_function = line[:-1]
+                test_case_map[current_function] = OrderedDict()
+
+                current_bb = ".bb_" + current_function.removeprefix(".function_") + ".entry"
+                test_case_map[current_function][current_bb] = []
+                continue
+
+            # basic block
+            current_bb = line[:-1]
+            if current_bb not in test_case_map[current_function]:
+                test_case_map[current_function][current_bb] = []
+
+        # parse lines and create their object representations
+        line_id = 1
+        for func_name, bbs in test_case_map.items():
+            # print(func_name)
+            line_id += 1
+            func = Function(func_name)
+            test_case.functions.append(func)
+            if func_name == ".function_main":
+                test_case.main = func
+
+            for bb_name, lines in bbs.items():
+                # print(">>", bb_name)
+                line_id += 1
+                if bb_name.endswith("entry"):
+                    bb = func.entry
+                elif bb_name.endswith("exit"):
+                    bb = func.exit
+                else:
+                    bb = BasicBlock(bb_name)
+                    func.insert(bb)
+
+                terminators_started = False
+                for line in lines:
+                    # print(f"    {line}")
+                    line_id += 1
+                    inst = self.parse_line(line, line_id, instruction_map)
+                    if inst.control_flow and not self.target_desc.is_call(inst):
+                        terminators_started = True
+                        bb.insert_terminator(inst)
+                    else:
+                        parser_assert(not terminators_started, line_id,
+                                      "Terminator not at the end of BB")
+                        bb.insert_after(bb.get_last(), inst)
+
+        # connect basic blocks
+        bb_names = {bb.name.upper(): bb for func in test_case for bb in func}
+        bb_names[".TEST_CASE_EXIT"] = func.exit
+        previous_bb = None
+        for func in test_case:
+            for bb in func:
+                # fallthrough
+                if previous_bb:  # skip the first BB
+                    # there is a fallthrough only if the last terminator is not a direct jump
+                    if not previous_bb.terminators or \
+                          not self.target_desc.is_unconditional_branch(previous_bb.terminators[-1]):
+                        previous_bb.successors.append(bb)
+                previous_bb = bb
+
+                # taken branches
+                for terminator in bb.terminators:
+                    for op in terminator.operands:
+                        if isinstance(op, LabelOperand):
+                            successor = bb_names[op.value]
+                            bb.successors.append(successor)
+
+        bin_file = asm_file[:-4] + ".o"
+        self.assemble(asm_file, bin_file)
+        test_case.bin_path = bin_file
+
+        self.map_addresses(test_case, bin_file)
+
+        return test_case
+
+    @abc.abstractmethod
+    def parse_line(self, line: str, line_num: int,
+                   instruction_map: Dict[str, List[InstructionSpec]]) -> Instruction:
+        pass
+
     @abc.abstractmethod
     def map_addresses(self, test_case: TestCase, bin_file: str) -> None:
         pass
@@ -169,6 +325,7 @@ class ConfigurableGenerator(Generator, abc.ABC):
             OT.LABEL: self.generate_label_operand,
             OT.AGEN: self.generate_agen_operand,
             OT.FLAGS: self.generate_flags_operand,
+            OT.COND: self.generate_cond_operand,
         }
         return generators[spec.type](spec, parent)
 
@@ -194,6 +351,10 @@ class ConfigurableGenerator(Generator, abc.ABC):
 
     @abc.abstractmethod
     def generate_flags_operand(self, spec: OperandSpec, _: Instruction) -> Operand:
+        pass
+
+    @abc.abstractmethod
+    def generate_cond_operand(self, spec: OperandSpec, _: Instruction) -> Operand:
         pass
 
     @abc.abstractmethod
@@ -270,7 +431,7 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
         func.insert_multiple(nodes)
         return func
 
-    def generate_instruction(self, spec: InstructionSpec):
+    def generate_instruction(self, spec: InstructionSpec) -> Instruction:
         # fill up with random operands, following the spec
         inst = Instruction.from_spec(spec)
 
@@ -289,9 +450,9 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
     def generate_reg_operand(self, spec: OperandSpec, parent: Instruction) -> Operand:
         reg_type = spec.values[0]
         if reg_type == 'GPR':
-            choices = self.register_set.registers[spec.width]
+            choices = self.target_desc.registers[spec.width]
         elif reg_type == "SIMD":
-            choices = self.register_set.simd_registers[spec.width]
+            choices = self.target_desc.simd_registers[spec.width]
         else:
             choices = spec.values
 
@@ -311,34 +472,78 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
         if spec.values:
             address_reg = random.choice(spec.values)
         else:
-            address_reg = random.choice(self.register_set.registers[64])
+            address_reg = random.choice(self.target_desc.registers[64])
         return MemoryOperand(address_reg, spec.width, spec.src, spec.dest)
 
     def generate_imm_operand(self, spec: OperandSpec, _: Instruction) -> Operand:
         if spec.values:
-            value = spec.values[0]
+            if spec.values[0] == "bitmask":
+                # FIXME: this implementation always returns the same bitmask
+                # make it random
+                value = str(pow(2, spec.width) - 2)
+            else:
+                assert "[" in spec.values[0], spec.values
+                range_ = spec.values[0][1:-1].split("-")
+                if range_[0] == "":
+                    range_ = range_[1:]
+                    range_[0] = "-" + range_[0]
+                assert len(range_) == 2
+                value = str(random.randint(int(range_[0]), int(range_[1])))
         else:
             value = str(random.randint(pow(2, spec.width - 1) * -1, pow(2, spec.width - 1) - 1))
         return ImmediateOperand(value, spec.width)
 
     def generate_label_operand(self, spec: OperandSpec, parent: Instruction) -> Operand:
-        raise NotSupportedException()
+        return LabelOperand("")  # the actual label will be set in add_terminators_in_function
 
     def generate_agen_operand(self, spec: OperandSpec, __: Instruction) -> Operand:
         n_operands = random.randint(1, 3)
-        reg1 = random.choice(self.register_set.registers[64])
+        reg1 = random.choice(self.target_desc.registers[64])
         if n_operands == 1:
             return AgenOperand(reg1, spec.width)
 
-        reg2 = random.choice(self.register_set.registers[64])
+        reg2 = random.choice(self.target_desc.registers[64])
         if n_operands == 2:
             return AgenOperand(reg1 + " + " + reg2, spec.width)
 
         imm = str(random.randint(0, pow(2, 16) - 1))
         return AgenOperand(reg1 + " + " + reg2 + " + " + imm, spec.width)
 
-    def generate_flags_operand(self, spec: OperandSpec, _: Instruction) -> Operand:
-        return FlagsOperand(spec.values)
+    def generate_flags_operand(self, spec: OperandSpec, parent: Instruction) -> Operand:
+        cond_op = parent.get_cond_operand()
+        if not cond_op:
+            return FlagsOperand(spec.values)
+
+        flag_values = self.target_desc.branch_conditions[cond_op.value]
+        if not spec.values:
+            return FlagsOperand(flag_values)
+
+        # combine implicit flags with the condition
+        merged_flags = []
+        for flag_pair in zip(flag_values, spec.values):
+            if "undef" in flag_pair:
+                merged_flags.append("undef")
+            elif "r/w" in flag_pair:
+                merged_flags.append("r/w")
+            elif "w" in flag_pair:
+                if "r" in flag_pair:
+                    merged_flags.append("r/w")
+                else:
+                    merged_flags.append("w")
+            elif "cw" in flag_pair:
+                if "r" in flag_pair:
+                    merged_flags.append("r/cw")
+                else:
+                    merged_flags.append("cw")
+            elif "r" in flag_pair:
+                merged_flags.append("r")
+            else:
+                merged_flags.append("")
+        return FlagsOperand(merged_flags)
+
+    def generate_cond_operand(self, spec: OperandSpec, _: Instruction) -> Operand:
+        cond = random.choice(list(self.target_desc.branch_conditions))
+        return CondOperand(cond)
 
     def add_terminators_in_function(self, func: Function):
         for bb in func:
@@ -359,12 +564,12 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
             elif len(bb.successors) == 2:
                 # Conditional branch
                 spec = random.choice(self.control_flow_instructions)
-                terminator = Instruction.from_spec(spec)
-                terminator.operands = [LabelOperand(bb.successors[0].name)]
-                for op in spec.implicit_operands:
-                    if op.type == OT.FLAGS:
-                        terminator.implicit_operands = [FlagsOperand(op.values)]
-                        break
+
+                terminator = self.generate_instruction(spec)
+                label = terminator.get_label_operand()
+                assert label
+                label.value = bb.successors[0].name
+
                 bb.terminators.append(terminator)
 
                 terminator = self.get_unconditional_jump_instruction()
@@ -400,17 +605,13 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
         search_for_store = random.random() < 0.5  # 50% probability of stores
 
         # select a random instruction spec for generation
-        while True:
-            instruction_spec = random.choice(self.non_control_flow_instructions)
-            if search_for_memory_access:
-                if instruction_spec.has_mem_operand and \
-                        instruction_spec.has_write == search_for_store:
-                    break
-            else:
-                if not instruction_spec.has_mem_operand:
-                    break
+        if not search_for_memory_access:
+            return random.choice(self.non_memory_access_instructions)
 
-        return instruction_spec
+        if search_for_store:
+            return random.choice(self.store_instructions)
+
+        return random.choice(self.load_instruction)
 
     @abc.abstractmethod
     def get_return_instruction(self) -> Instruction:
@@ -419,6 +620,7 @@ class RandomGenerator(ConfigurableGenerator, abc.ABC):
     @abc.abstractmethod
     def get_unconditional_jump_instruction(self) -> Instruction:
         pass
+<<<<<<< HEAD
 
 
 # ==================================================================================================
@@ -1266,3 +1468,5 @@ def get_generator(instruction_set: InstructionSet) -> Generator:
 
     ConfigException("unknown value of `instruction_set` configuration option")
     exit(1)
+=======
+>>>>>>> dd059fe6094132fb0195ea55eb349ea7923262ea

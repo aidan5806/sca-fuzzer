@@ -7,23 +7,16 @@ SPDX-License-Identifier: MIT
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List
 from copy import copy
 
+import factory
 from interfaces import CTrace, HTrace, Input, InputTaint, EquivalenceClass, TestCase, Generator, \
     InputGenerator, Model, Executor, Analyser, Coverage, InputID
-from generator import get_generator
-from input_generator import get_input_generator
-from model import get_model
-from executor import get_executor
-from analyser import get_analyser
-from coverage import get_coverage
 from isa_loader import InstructionSet
 
 from config import CONF
 from service import STAT, LOGGER, TWOS_COMPLEMENT_MASK_64, bit_count
-
-Multiprimer = Dict[Input, List[Input]]
 
 
 class Fuzzer:
@@ -40,12 +33,22 @@ class Fuzzer:
     def __init__(self, instruction_set_spec: str, work_dir: str, existing_test_case: str = ""):
         self.existing_test_case = existing_test_case
         if existing_test_case:
-            CONF._no_generation = True
+            CONF.setattr_internal("_no_generation", True)
             CONF.gpr_blocklist = []
             CONF.instruction_blocklist = []
 
         self.instruction_set = InstructionSet(instruction_set_spec, CONF.supported_categories)
         self.work_dir = work_dir
+
+    def initialize_modules(self):
+        """ create all main modules """
+        self.generator = factory.get_generator(self.instruction_set)
+        self.input_gen: InputGenerator = factory.get_input_generator()
+        self.executor: Executor = factory.get_executor()
+        self.model: Model = factory.get_model(self.executor.read_base_addresses())
+        self.analyser: Analyser = factory.get_analyser()
+        self.coverage: Coverage = factory.get_coverage(self.instruction_set, self.executor,
+                                                       self.model, self.analyser)
 
     def start(self, num_test_cases: int, num_inputs: int, timeout: int, nonstop: bool = False):
         start_time = datetime.today()
@@ -125,27 +128,22 @@ class Fuzzer:
 
         # Try priming the inputs that disagree with the other ones within the same eq. class
         STAT.required_priming += 1
-        while violations:
-            LOGGER.fuzzer_priming(len(violations))
-            violation: EquivalenceClass = violations.pop()
-            if self.survives_priming(violation, boosted_inputs):
+        violation_stack = list(violations)  # make a copy
+        while violation_stack:
+            LOGGER.fuzzer_priming(len(violation_stack))
+            violation: EquivalenceClass = violation_stack.pop()
+            if self.priming(violation, boosted_inputs):
                 break
         else:
-            # all violations were cleaned. all good
+            # All violations were cleared by priming.
+            # Check whether it was actually successful priming
+            # or the measurement are just flaky
+            if self.check_if_reproducible(violations, boosted_inputs, htraces):
+                STAT.flaky_violations += 1
             return None
 
         # Violation survived priming. Report it
         return violation
-
-    def initialize_modules(self):
-        """ create all main modules """
-        self.generator = get_generator(self.instruction_set)
-        self.input_gen: InputGenerator = get_input_generator()
-        self.executor: Executor = get_executor()
-        self.model: Model = get_model(self.executor.read_base_addresses())
-        self.analyser: Analyser = get_analyser()
-        self.coverage: Coverage = get_coverage(self.instruction_set, self.executor, self.model,
-                                               self.analyser)
 
     def boost_inputs(self, inputs: List[Input], nesting: int) -> List[Input]:
         taints: List[InputTaint]
@@ -171,10 +169,61 @@ class Fuzzer:
             shutil.copy2(CONF.config_path, self.work_dir + "/config.yaml")
 
     # ==============================================================================================
-    # Priming algorithm
-    def survives_priming(self, org_violation: EquivalenceClass, all_inputs: List[Input]) -> bool:
+    # Single-stage interfaces
+    @staticmethod
+    def analyse_traces_from_files(ctrace_file: str, htrace_file: str):
+        LOGGER.fuzzer_debug = False  # make sure we don't try to call the model
+        LOGGER.fuzzer_start(0, datetime.today())
+        STAT.test_cases = 1
+
+        # read traces
+        ctraces: List[CTrace] = []
+        htraces: List[HTrace] = []
+
+        with open(ctrace_file, 'r') as f:
+            for line in f:
+                ctraces.append(int(line))
+        with open(htrace_file, 'r') as f:
+            for line in f:
+                htraces.append(int(line))
+
+        assert len(ctraces) == len(htraces), \
+            "The number of hardware traces does not match the number of contract traces"
+
+        dummy_inputs = factory.get_input_generator().generate(1, len(ctraces))
+
+        # check for violations
+        analyser = factory.get_analyser()
+        violations = analyser.filter_violations(dummy_inputs, ctraces, htraces, True)
+
+        # print results
+        if violations:
+            LOGGER.fuzzer_report_violations(violations[0], None)
+
+        LOGGER.fuzzer_finish()
+
+    # ==============================================================================================
+    # Priming and reproducibility
+    def check_if_reproducible(self, violations: List[EquivalenceClass], inputs: List[Input],
+                              org_htraces: List[HTrace]) -> bool:
+        violating_input_ids = []
+        for violation in violations:
+            for measurement in violation.measurements:
+                violating_input_ids.append(measurement.input_id)
+
+        # re-collect htraces
+        htraces: List[HTrace] = self.executor.trace_test_case(inputs, CONF.executor_repetitions)
+
+        # check if all htraces that had a violation match
+        for i in violating_input_ids:
+            if htraces[i] != org_htraces[i]:
+                return True
+        return False
+
+    def priming(self, org_violation: EquivalenceClass, all_inputs: List[Input]) -> bool:
         """
         Try priming the inputs that caused the violations
+
         return: True if the violation survived priming
         """
         violation = copy(org_violation)
@@ -195,106 +244,16 @@ class Fuzzer:
                 primer[current_input_id] = all_inputs[input_id]
 
                 # try priming
-                if not self.primer_is_effective(primer, [current_input_id], current_htrace):
-                    return True
+                htraces: List[HTrace] = self.executor.trace_test_case(primer,
+                                                                      CONF.executor_repetitions)
+                primed_htrace = htraces[current_input_id]
+                if primed_htrace == current_htrace:
+                    continue
 
-        return False
+                # if the primed measurement triggered more speculation, it's ok
+                if (primed_htrace ^ TWOS_COMPLEMENT_MASK_64) & current_htrace == 0:
+                    continue
 
-    def primer_is_effective(self, inputs: List[Input], positions: List[InputID],
-                            expected_htrace: HTrace) -> bool:
-        htraces: List[HTrace] = self.executor.trace_test_case(inputs, CONF.executor_repetitions)
-        for i, htrace in enumerate(htraces):
-            if i not in positions:
-                continue
-            if htrace == expected_htrace:
-                continue
-
-            # if the primed measurement triggered more speculation, it's ok
-            if (htrace ^ TWOS_COMPLEMENT_MASK_64) & expected_htrace == 0:
-                continue
-
-            return False
-        return True
-
-    # ==============================================================================================
-    # Batched priming algoritm - deprecated???
-    def survives_priming_batched(self, org_violation: EquivalenceClass,
-                                 all_inputs: List[Input]) -> bool:
-        violation = copy(org_violation)
-        ordered_htraces = sorted(
-            violation.htrace_map.keys(), key=lambda x: bit_count(x), reverse=False)
-
-        for current_htrace in ordered_htraces:
-            current_input_id = violation.htrace_map[current_htrace][-1].input_id
-
-            # list of inputs that produced a different HTrace
-            input_ids_to_test: List[InputID] = [
-                m.input_id for m in violation.measurements if m.htrace != current_htrace
-            ]
-
-            # create a primer that would cover all the conflicting inputs at the same time
-            batch_primer, primed_ids = self.build_batch_primer(all_inputs,
-                                                               current_input_id, current_htrace,
-                                                               len(input_ids_to_test))
-            if not batch_primer:
-                STAT.priming_errors += 1
-                # self.store_test_case(self.test_case, True)
-                return False
-
-            # insert the tested inputs into their places
-            assert len(primed_ids) == len(input_ids_to_test)
-            for input_id, primer_id in zip(input_ids_to_test, primed_ids):
-                batch_primer[primer_id] = all_inputs[input_id]
-
-            # try priming
-            if not self.primer_is_effective(batch_primer, primed_ids, current_htrace):
                 return True
 
         return False
-
-    def build_batch_primer(self, inputs: List[Input], target_input_id: InputID,
-                           expected_htrace: HTrace,
-                           num_primed_inputs: int) -> Tuple[List[Input], List[InputID]]:
-        # the first size to be tested
-        primer_size = CONF.min_primer_size % len(inputs) + 1
-
-        while True:
-            # print(f"Trying primer {primer_size}")
-            # build a set of priming inputs (i.e., multiprimer)
-            if primer_size <= target_input_id:
-                primer = inputs[target_input_id - primer_size:target_input_id + 1]
-            else:
-                primer = inputs[target_input_id - primer_size:] + inputs[:target_input_id + 1]
-            assert len(primer) == primer_size + 1
-            assert primer[-1].seed == inputs[target_input_id].seed
-
-            batch_primer = primer * num_primed_inputs
-            # print(target_input_id, primer_size, len(inputs), len(primer))
-            primed_ids = list(
-                range(primer_size, num_primed_inputs * (primer_size + 1), primer_size + 1))
-            # print(primed_ids)
-
-            # check if the hardware trace of the target_id matches
-            # the hardware trace received with the primer
-            if self.primer_is_effective(batch_primer, primed_ids, expected_htrace):
-                return batch_primer, primed_ids
-
-            # if we failed, try a larger primer
-            new_size = primer_size * 2
-
-            # if we just wrapped around, try all original preceding inputs as primer
-            if new_size > target_input_id and primer_size < target_input_id:
-                primer_size = target_input_id
-            else:
-                primer_size = new_size
-
-            # if a larger primer is allowed, try adding more inputs
-            if primer_size > CONF.max_primer_size:
-                # otherwise, we failed to find a primer
-                LOGGER.waring("fuzzer", "Failed to build a primer - max_primer_size reached")
-                return [], []
-
-            # run out of inputs to test?
-            if primer_size >= len(inputs):
-                LOGGER.waring("fuzzer", "Insufficient inputs to build a primer")
-                return [], []

@@ -10,8 +10,8 @@ import os
 import yaml
 from typing import Dict
 from argparse import ArgumentParser
+from factory import get_minimizer
 from fuzzer import Fuzzer
-from postprocessor import Postprocessor
 from config import CONF
 from service import LOGGER
 
@@ -67,6 +67,23 @@ def main():
         help="Don't stop after detecting an unexpected result"
     )
 
+    parser_analyser = subparsers.add_parser('analyse')
+    parser_analyser.add_argument(
+        '--ctraces',
+        type=str,
+        required=True,
+    )
+    parser_analyser.add_argument(
+        '--htraces',
+        type=str,
+        required=True,
+    )
+    parser_analyser.add_argument(
+        "-c", "--config",
+        type=str,
+        required=False
+    )
+
     parser_mini = subparsers.add_parser('minimize')
     parser_mini.add_argument(
         '--infile', '-i',
@@ -109,8 +126,7 @@ def main():
         with open(args.config, "r") as f:
             config_update: Dict = yaml.safe_load(f)
         for var, value in config_update.items():
-            CONF.set(var, value)
-    CONF.sanity_check()
+            setattr(CONF, var, value)
     LOGGER.set_logging_modes()
 
     # Fuzzing
@@ -129,11 +145,15 @@ def main():
         )
         return
 
-    # Test Case minimisation
+    # Trace analysis
+    if args.subparser_name == 'analyse':
+        fuzzer = Fuzzer.analyse_traces_from_files(args.ctraces, args.htraces)
+        return
+
+    # Test case minimisation
     if args.subparser_name == "minimize":
-        CONF.coverage_type = 'none'
-        postprocessor = Postprocessor(args.instruction_set)
-        postprocessor.minimize(args.infile, args.outfile, args.num_inputs, args.add_fences)
+        minimizer = get_minimizer(args.instruction_set)
+        minimizer.minimize(args.infile, args.outfile, args.num_inputs, args.add_fences)
         return
 
     raise Exception("Unreachable")

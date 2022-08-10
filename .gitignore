@@ -1,6 +1,7 @@
 cmake-build-*/
 build/
 .vscode/
+.mypy_cache/
 .lsync*
 venv/
 **/__pycache__/
@@ -12,3 +13,4 @@ src/tmp.asm
 experiments/
 *.code-workspace
 src/custom_conf.yaml
+*.o
