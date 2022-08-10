@@ -889,13 +889,7 @@ class X86Generator(ConfigurableGenerator, abc.ABC):
             line = re.search(r"(.*)#.*", line).group(1).strip()  # type: ignore
 
         # extract operands
-        if (sys.version_info >= (3, 9)):
-            operands_raw = line.removeprefix(name).split(",")
-        else:
-            if line.startswith(name):
-                operands_raw = line[len(name):].split(",")
-            else:
-                operands_raw = line.split(",")
+        operands_raw = line.removeprefix(name).split(",")
         if operands_raw == [""]:  # no operands
             operands_raw = []
         else:  # clean the operands
@@ -1468,5 +1462,3 @@ def get_generator(instruction_set: InstructionSet) -> Generator:
 
     ConfigException("unknown value of `instruction_set` configuration option")
     exit(1)
-=======
->>>>>>> dd059fe6094132fb0195ea55eb349ea7923262ea
